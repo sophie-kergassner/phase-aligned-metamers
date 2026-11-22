@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase-Aligned Metamers (WebGPU)</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1f1f1f; --bg: #fafafa; --panel: #ffffff; --muted: #6b6b6b;
+          --line: rgba(128,128,128,0.35); --accent: #377d8e; --accent-bg: rgba(55,125,142,0.12); }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e6e6e6; --bg: #161616; --panel: #1f1f1f; --muted: #9a9a9a; --accent-bg: rgba(55,125,142,0.25); } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 40px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px; color: var(--fg); background: var(--bg); }
+  main { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  [hidden] { display: none !important; }
+
+  /* pipeline flowchart */
+  .flow { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 18px; margin-top: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+  /* 6 x 1 -> 3 x 2 -> 2 x 3: main.js picks the columns from the chip labels (data-cols); no arrow off the end of a row */
+  .flow[data-cols="3"] .node:nth-child(3n)::after, .flow[data-cols="2"] .node:nth-child(2n)::after { content: none; }
+  .flow[data-cols="1"] .node:not(:last-child)::after { content: '↓'; right: auto; top: auto; left: 50%; bottom: -19px; transform: translateX(-50%); }
+  /* each node spans two rows of the flow grid (title, chips) as a subgrid, so all chips start at the same height */
+  .node { position: relative; display: grid; grid-row: span 2; grid-template-rows: subgrid; row-gap: 6px; align-content: start; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+  .node:not(:last-child)::after { content: '→'; position: absolute; right: -15px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+  .node.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .node-title { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .chips { display: flex; flex-direction: column; gap: 4px; }
+  .chip { white-space: nowrap; overflow: hidden; font: inherit; font-size: 12px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 12px; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+  .chip:hover { border-color: var(--accent); }
+  .chip.on { background: var(--accent-bg); border-color: var(--accent); font-weight: 600; }
+
+  .viewer { position: relative; line-height: 0; border-radius: 4px; overflow: hidden; background: #000; }
+  .pam-fs { position: absolute; right: 10px; bottom: 10px; padding: 6px; line-height: 0; border: 0; border-radius: 6px;
+    background: none; color: var(--gray-light, #f1efe3); cursor: pointer; opacity: 0.85; filter: drop-shadow(0 1px 6px rgba(0, 0, 0, 0.35)); }
+  .pam-fs:hover, .pam-fs:focus-visible { opacity: 1; }
+  .pam-icons { position: absolute; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 4px; }
+  .pam-popover { position: absolute; right: 10px; bottom: 44px; max-width: 280px; padding: 8px 10px; border-radius: 5px;
+                 background: rgba(250, 250, 250, 0.95); color: #1f1f1f; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25);
+                 font-size: 12px; line-height: 1.4; }
+  .pam-popover p { margin: 0; }
+  .pam-icons .pam-fs { position: static; padding: 6px 5px; }   /* visible gap between icons: 5 + 4 + 5 px */
+  .pam-overlay { position: absolute; top: 10px; left: 10px; line-height: normal; border: 0; background: rgba(250, 250, 250, 0.85);
+                 color: #1f1f1f; box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25); }
+  .pam-levels { left: auto; right: 10px; }
+  .pam-phase { top: 38px; }   /* Phase view: under the Measured / Repaired toggle */
+  .pam-mask { left: auto; right: 10px; top: 38px; flex-direction: column; }   /* drops down from the All button */
+  .pam-mask button + button { border-left: 0; border-top: 1px solid var(--line); }
+  .pam-thumb.off canvas { opacity: 0.3; }
+  .viewer:fullscreen { display: flex; align-items: center; justify-content: center; border-radius: 0; }
+  input[type=number] { font: inherit; width: 72px; padding: 2px 4px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; }
+  canvas { display: block; cursor: crosshair; touch-action: none; }
+
+  /* legend and context controls under the image */
+  /* the four sliders under the image: 4 x 1 -> 2 x 2 -> 1 x 4 by the demo's width */
+  main { container-type: inline-size; }
+  .below { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 24px; align-items: center; margin-top: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+  .below:not(:has(> :not([hidden]))) { display: none; }
+  #noiseFromRow { grid-column: 1 / -1; }
+  @container (max-width: 600px) { .below { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @container (max-width: 380px) { .below { grid-template-columns: 1fr; } }
+  /* legend: one line in the bottom-left corner, light text and bar with a soft shadow (like the full-screen button);
+     numbers in fixed-width boxes with tabular (equal-width) digits, so the bar does not move when they change */
+  .pam-legend { position: absolute; left: 10px; bottom: 10px; display: flex; align-items: center; gap: 6px;
+                color: #f1efe3; font-size: 11px; line-height: normal; font-variant-numeric: tabular-nums;
+                filter: drop-shadow(0 1px 6px rgba(0, 0, 0, 0.35)); }
+  #legendMin { text-align: right; }   /* width per view: main.js */
+  .pam-legend-bar { width: 120px; height: 8px; border-radius: 3px; }
+  .pam-legend-unit { margin-left: -2px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .seg button { font: inherit; font-size: 12px; padding: 3px 10px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .pam-split { display: inline-grid; grid-template-columns: 1fr 1fr; }   /* two options, 50:50 */
+  .pam-row { flex: 1 1 380px; }   /* label on the left, the two-option button filling the rest */
+  .pam-row .pam-split { flex: 1; }
+  .pam-row { display: flex; align-items: center; gap: 8px; }
+  .pam-plotbtn { font: inherit; display: inline-flex; align-items: center; padding: 3px 8px; border: 1px solid var(--line); border-radius: 5px;
+                 background: transparent; color: inherit; cursor: pointer; }
+  .pam-plotbtn.on { background: var(--accent-bg); border-color: var(--accent); }
+  .seg button.on { background: var(--accent-bg); font-weight: 600; }
+  label { display: flex; align-items: center; gap: 8px; }
+  select, input[type=range] { accent-color: var(--accent); }
+  select { font: inherit; padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; }
+
+  .settings { display: flex; flex-wrap: wrap; gap: 10px 24px; align-items: center; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .info { margin-top: 10px; }
+  /* fill sliders: the range input drawn as a button that fills from the left, its label on top */
+  .pam-fill { position: relative; display: block; height: 28px; }
+  .pam-fill input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 100%; margin: 0; border-radius: 6px;
+      background: linear-gradient(to right, var(--accent) var(--p, 50%), var(--accent-bg) var(--p, 50%)); cursor: ew-resize; }
+  .pam-fill input[type=range]::-webkit-slider-runnable-track { height: 100%; background: transparent; }
+  .pam-fill input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 0; height: 100%; }
+  .pam-fill input[type=range]::-moz-range-track { height: 100%; background: transparent; border: 0; }
+  .pam-fill input[type=range]::-moz-range-thumb { width: 0; height: 100%; border: 0; background: transparent; }
+  .pam-fill-text { position: absolute; left: 10px; right: 10px; top: 50%; transform: translateY(-50%); pointer-events: none;
+      font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .pam-fill-light { left: 0; right: 0; padding: 0 10px; color: white; clip-path: inset(0 calc(100% - var(--p, 50%)) 0 0); }
+  .note { margin: 10px 0 0; max-width: 760px; color: var(--muted); }
+  .setup { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 24px; align-items: center; margin-top: 12px; padding-top: 10px;
+           border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  .setup-title { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+  .setup input[type=number] { width: 60px; font-size: 12px; }
+  .setup .pam-fill { height: 18px; }   /* grey and low: secondary settings */
+  .setup .pam-fill input[type=range] { background: linear-gradient(to right, var(--line) var(--p, 50%), transparent var(--p, 50%)); outline: 1px solid var(--line); }
+  .setup .pam-fill-light { color: var(--fg); }
+  .setup input[type=number] { height: 18px; padding: 0 4px; }
+  .hint { cursor: help; opacity: 0.6; }
+  .keep { display: contents; }
+  .thumbs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+  .pam-thumb { font: inherit; font-size: 12px; padding: 0; border: 2px solid transparent; border-radius: 4px; background: none; color: inherit; cursor: pointer; text-align: left; overflow: hidden; }
+  .pam-thumb.on { border-color: var(--accent); }
+  .pam-thumb, .pam-thumb canvas { cursor: pointer; }
+  .pam-thumb:hover:not(.on) { border-color: var(--line); }
+  .pam-thumb:hover span { color: var(--fg); }
+  .pam-thumb canvas { display: block; width: 100%; }
+  .pam-thumb span { display: block; padding: 2px 4px; color: var(--muted); }
+  .fitplot { margin-top: 8px; color: var(--fg); }
+  .fitplot .pam-fit-caption { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 16px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 10px; }
+  #status { color: var(--muted); }
+  #status.error { color: #be0b4b; font-weight: 600; }
+</style>
+</head>
+<body>
+<main data-pam-demo data-base="">
+  <h1>Phase-Aligned Metamers</h1>
+  <p class="sub">The full pipeline on the GPU, recomputed for every gaze position. Move the mouse over the image to move the gaze, click to freeze it. Pick a stage of the pipeline below to see its result.</p>
+
+  <div class="viewer"><canvas id="canvas"></canvas>
+    <div id="legend" class="pam-legend" hidden><span id="legendMin"></span><div id="legendBar" class="pam-legend-bar"></div><span id="legendMax"></span><span id="legendUnit" class="pam-legend-unit"></span></div>
+    <div id="levelBox" class="seg pam-overlay pam-levels" title="pyramid level" hidden></div>
+    <div id="maskBox" class="seg pam-overlay pam-mask" title="levels included in the noise" hidden></div>
+    <div id="fovBox" class="seg pam-overlay" hidden>
+      <button data-fov="blur" class="on" title="every pixel blurred with the Gaussian of its pyramid level (the base image of the method)">Per-Pixel Blur</button>
+      <button data-fov="pyramid" title="blended from the pyramid levels with the masks (as a renderer with mipmaps would)">Pyramid</button>
+      <button data-fov="diff" title="difference of the two foveations in luminance (per-pixel blur minus pyramid)">Difference</button>
+    </div>
+    <div id="enhBox" class="seg pam-overlay" hidden>
+      <button data-enh="1" class="on" title="foveated image with the synthesized noise added (our method)">Enhancement On</button>
+      <button data-enh="0" title="foveated image only, without the noise">Enhancement Off</button>
+    </div>
+    <div id="variantBox" class="seg pam-overlay" hidden>
+      <button data-variant="measured" title="measured on the image chosen under 'Measure Statistics On'">Measured</button>
+      <button data-variant="repaired" class="on" title="after the repair (extrapolated from coarser levels)">Repaired/Extrapolated</button>
+    </div>
+    <div id="phaseBox" class="seg pam-overlay pam-phase" hidden>
+      <button data-phase="angle" class="on" title="the phase angle (cyclic colour map)">Angle</button>
+      <button data-phase="structure" title="which structure the phase describes: line (blue, near 0° / 180°), edge (crimson, near ±90°), no data (white, little energy)">Line / Edge</button>
+    </div><div id="infoPop" class="pam-popover" role="dialog" hidden><p><span id="status">Starting ...</span> <span id="frame" class="mono"></span></p></div><div class="pam-icons"><select id="image" hidden>
+        <option value="../images/classroom.jpg">Classroom</option>
+        <option value="../images/drawnhouse.jpg">Drawn House</option>
+        <option value="../images/face.jpg" selected>Face</option>
+        <option value="../images/fish.jpg">Fish</option>
+        <option value="../images/italianflat.jpg">Italian Flat</option>
+        <option value="../images/mossytree.jpg">Mossy Tree</option>
+      </select><button type="button" id="infoBtn" class="pam-fs" aria-expanded="false"></button><button type="button" id="sceneBtn" class="pam-fs"></button><button type="button" id="autoGazeBtn" class="pam-fs"></button><button type="button" id="showGazeBtn" class="pam-fs"></button><button type="button" id="fullscreen" class="pam-fs" title="Full screen (Esc to leave); the foveation follows the image's physical size" aria-label="Full screen"></button></div></div>
+  <p id="viewNote" class="note" hidden></p>
+  <div id="flow" class="flow"></div>
+
+  <div class="below">
+    <label id="gainBox" hidden class="pam-fill" title="scales the added noise; 1 = as computed by the pipeline, 0 = foveated image only"><input id="gain" type="range" min="0" max="2" step="0.05" value="1"><span class="pam-fill-text">Noise Amp. <span id="gainVal">1.00</span></span>
+    </label>
+    <div id="keepBox" class="keep" hidden>
+      <label class="pam-fill" title="how much of the measured statistic the noise uses: 1 = as measured, 0 = a fixed random field, in between a blend (angles on the unit circle)"><input id="keepI" type="range" min="0" max="1" step="0.05" value="1"><span class="pam-fill-text">Intensity <span id="keepIVal">1.00</span></span>
+      </label>
+      <label class="pam-fill" title="how much of the measured statistic the noise uses: 1 = as measured, 0 = a fixed random field, in between a blend (angles on the unit circle)"><input id="keepD" type="range" min="0" max="1" step="0.05" value="1"><span class="pam-fill-text">Orientation <span id="keepDVal">1.00</span></span>
+      </label>
+      <label class="pam-fill" title="how much of the measured statistic the noise uses: 1 = as measured, 0 = a fixed random field, in between a blend (angles on the unit circle)"><input id="keepP" type="range" min="0" max="1" step="0.05" value="1"><span class="pam-fill-text">Phase <span id="keepPVal">1.00</span></span>
+      </label>
+    </div>
+    <div id="noiseFromRow" class="pam-row" title="Which statistics the noise is synthesized from. Extrapolated: the repaired statistics, extrapolated from the coarser levels into the blurred ones (our method). Measured: the statistics as measured, without the repair (on the image chosen under Measure Statistics On; with Full Res this is the ground truth)." hidden>Noise From
+      <span class="seg pam-split" id="noiseFromBox">
+        <button data-from="rep" class="on">Extrapolated Statistics</button>
+        <button data-from="meas">Measured Statistics</button>
+      </span>
+    </div>
+  </div>
+
+  <div class="settings">
+    <div title="Which image the statistics are measured on. Full res: the original image, as in the paper. Foveated: the already foveated image, as a renderer would have it. This mainly changes the intensity: the Gaussian pyramid is built a second time from the foveated image, so the bands lose some more frequencies near the levels that are already blurred." class="pam-row">Measure Statistics On
+      <span class="seg pam-split" id="analyseBox">
+        <button data-analyse="1">Foveated</button>
+        <button data-analyse="0" class="on">Full Res (Paper)</button>
+      </span>
+    </div>
+    <div title="How the noise strength per level is found: a line is fitted through the standard deviation of the Laplacian bands. Paper: only the bands from the cutoff level on, which are not blurred anywhere. The line jumps when the cutoff level changes with gaze or distance. Weighted (web version, not in the paper): all bands, each measured only where its level is fully kept and weighted by that share of the image, so the fit changes smoothly with gaze and distance." class="pam-row">Intensity Fit
+      <span class="seg pam-split" id="fitBox">
+        <button data-fit="weighted" class="on">Weighted</button>
+        <button data-fit="cutoff">Unweighted (Paper)</button>
+      </span>
+      <button type="button" id="fitPlotBtn" class="pam-plotbtn" title="Show the intensity fit plot" aria-expanded="false"><svg viewBox="1 3 22 18" width="16" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4v16h20"/><path d="M6 16l5-5 4 3 6-7"/></svg></button>
+    </div>
+  </div>
+
+  <div id="fitPlot" class="fitplot" hidden></div>
+
+  <div class="setup">
+    <label class="pam-fill" title="Measure the width of the image on your screen with a ruler and set it here; with it the eccentricities are right. It is kept when you resize the window, zoom or go full screen."><input id="imageCm" type="range" min="10" max="150" step="0.1" value="50"><span class="pam-fill-text">Image Width (Measured) <span id="imageCmVal">50.0 cm</span></span>
+    </label>
+    <label class="pam-fill"><input id="distance" type="range" min="30" max="200" step="1" value="50"><span class="pam-fill-text">Viewing Distance <span id="distanceVal">50 cm</span></span>
+    </label>
+  </div>
+
+</main>
+<script type="module" src="main.js"></script>
+</body>
+</html>
