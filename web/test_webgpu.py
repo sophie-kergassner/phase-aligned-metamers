@@ -12,6 +12,8 @@ Usage (from the repository root):
 --measured           noise from the measured statistics (no repair; the web version's "Noise From: Measured")
 --keep=I,D,P         effect of the parameters: keep_intensity, keep_dir, keep_phase (NoiseGenerator.randomize_stats),
                      with the web version's random fields (hash, see web_rand) instead of torch.rand
+--no-align           without the phase convention alignment (Worm(align_phase_convention=False), the paper's
+                     behaviour; GPU: RepairParams.align = 0); default: aligned on both sides
 --write-constants    rewrite web/constants.json from the package
 
 The host logic here mirrors web/main.js (same textures, bind group layouts, dispatch order), so a passing test
@@ -26,7 +28,7 @@ import numpy as np
 import torch
 import wgpu
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
 import phase_aligned_metamers.imagestats_utils as isu
 import phase_aligned_metamers.phase_analysis_utils as phu
 from phase_aligned_metamers.image import Image
@@ -35,6 +37,7 @@ from phase_aligned_metamers.view_config import ViewConfig
 from phase_aligned_metamers.worm import Worm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ALIGN = '--no-align' not in sys.argv   # phase convention alignment (fixes/1_phase_sign_alignment.md), on both sides
 SCREEN_WIDTH_CM, SCREEN_WIDTH_PX, VIEWING_DISTANCE = 120, 3840, 100
 MAX_PYR_DEPTH = 5
 ANALYSIS_LEVELS = MAX_PYR_DEPTH + 1   # levels 0..5: cutoff (<= 4) + 1 extra level for the phase repair
@@ -249,7 +252,8 @@ def web_rand(h, w, s, k):
 
 
 def randomize_web(worm, keep):
-    """NoiseGenerator.randomize_stats with the web version's random fields, applied to the repaired statistics."""
+    """NoiseGenerator.randomize_stats with the web version's random fields, applied to the repaired statistics.
+    (The GPU's phase tracking starts from the current orientation, so in a single frame it changes nothing.)"""
     ki, kd, kp = keep
     def cyclical_blend(a, b, k):
         return (k * torch.polar(torch.ones_like(a), a) + (1 - k) * torch.polar(torch.ones_like(b), b)).angle()
@@ -268,8 +272,8 @@ def reference(img_path, vc, analysis_src=None, intensity_fit='weighted', keep=No
     foveated one); the test passes the GPU's own foveated image, so that both analyse exactly the same input."""
     img = Image('cpu', img_path, vc.kernel_map)
     h, w = img.ycbcr.shape[2:]
-    worm = Worm('cpu', img.ycbcr if analysis_src is None else analysis_src, vc.pyr_level_map, MAX_PYR_DEPTH)
-    worm_orig = worm if analysis_src is None else Worm('cpu', img.ycbcr, vc.pyr_level_map, MAX_PYR_DEPTH)
+    worm = Worm('cpu', img.ycbcr if analysis_src is None else analysis_src, vc.pyr_level_map, MAX_PYR_DEPTH, align_phase_convention=ALIGN)
+    worm_orig = worm if analysis_src is None else Worm('cpu', img.ycbcr, vc.pyr_level_map, MAX_PYR_DEPTH, align_phase_convention=ALIGN)
     worm_orig.compute_foveated_imgs()
     for step in ['compute_R', 'compute_theta', 'compute_steered_G_H', 'compute_phase']:
         worm.y = getattr(worm, step)(worm.y)
@@ -330,10 +334,13 @@ def main(img_path, uniform_level=None, analyse_foveated=False, intensity_fit='we
         'lap_finalize': gpu.pipeline(['lap_finalize'], [uniform_entry(0), ro_entry(1), rw_entry(2)]),
         'fit': gpu.pipeline(['fit'], [uniform_entry(0), ro_entry(1), rw_entry(2)]),
         'rep_init': gpu.pipeline(['sampling', 'repair_common', 'repair_init'], [uniform_entry(0), tex_entry(1), storage_entry(2, 'rgba32float'), ro_entry(15)]),
-        'rep_phi': gpu.pipeline(['sampling', 'repair_common', 'repair_phi'], [uniform_entry(0), *tex_entries(1, 4), storage_entry(5, 'rgba32float')]),
-        'rep_level': gpu.pipeline(['sampling', 'repair_common', 'repair_level'], [uniform_entry(0), *tex_entries(1, 5), storage_entry(6, 'rgba32float'), ro_entry(15)]),
+        'rep_phi': gpu.pipeline(['sampling', 'repair_common', 'repair_phi'], [uniform_entry(0), *tex_entries(1, 4), storage_entry(5, 'rgba32float'), tex_entry(6), tex_entry(7)]),
+        'rep_level': gpu.pipeline(['sampling', 'repair_common', 'repair_level'], [uniform_entry(0), *tex_entries(1, 5), storage_entry(6, 'rgba32float'), tex_entry(7), ro_entry(15)]),
         'sem': gpu.pipeline(['sampling', 'repair_common', 'semantics'], [uniform_entry(0), *tex_entries(1, 4), storage_entry(5, 'rgba32float')]),
-        'band': gpu.pipeline(['noise_band'], [uniform_entry(0), ro_entry(1), tex_entry(2), storage_entry(3, 'r32float'), ro_entry(4)]),
+        'semH': gpu.pipeline(['sem_smooth'], [tex_entry(0), storage_entry(1, 'rgba32float')], 'sem_h'),
+        'semV': gpu.pipeline(['sem_smooth'], [tex_entry(0), storage_entry(1, 'rgba32float')], 'sem_v'),
+        'band': gpu.pipeline(['noise_band'], [uniform_entry(0), ro_entry(1), tex_entry(2), storage_entry(3, 'r32float'), ro_entry(4), tex_entry(5)]),
+        'track': gpu.pipeline(['noise_band'], [uniform_entry(0), tex_entry(2), tex_entry(6), storage_entry(7, 'r32float')], 'track'),
         'compose': gpu.pipeline(['common', 'sampling', 'compose'], [uniform_entry(0), uniform_entry(1), *tex_entries(2, 8), ro_entry(9),
                                                                      storage_entry(10, 'rgba32float'), ro_entry(11)]),
     }
@@ -421,9 +428,9 @@ def main(img_path, uniform_level=None, analyse_foveated=False, intensity_fit='we
     for i in range(0 if measured else cut, n_analysis):
         gpu.run(P['rep_init'], [(0, gpu.uniform(i, 0, 0, 0)), (1, analysis[i]), (2, reps[i]), (15, fit_buf)], *sizes[i])
     for i in range(-1 if measured else cut - 1, -1, -1):
-        gpu.run(P['rep_phi'], [gpu.uniform(i, 0, 0, 0), analysis[i + 1], reps[i + 1], analysis[i + 2], reps[i + 2], phis[i + 1]], *sizes[i + 1])
-        gpu.run(P['rep_level'], [(0, gpu.uniform(i, 0, 0, 0)), (1, maps), (2, analysis[i]), (3, reps[i + 1]), (4, analysis[i + 1]),
-                                 (5, phis[i + 1]), (6, reps[i]), (15, fit_buf)], *sizes[i])
+        gpu.run(P['rep_phi'], [gpu.uniform(i, 0, int(ALIGN), 0), analysis[i + 1], reps[i + 1], analysis[i + 2], reps[i + 2], phis[i + 1], analysis[i + 1], maps], *sizes[i + 1])   # 6, 7: Fix 4 inputs (off: unused)
+        gpu.run(P['rep_level'], [(0, gpu.uniform(i, 0, int(ALIGN), 0)), (1, maps), (2, analysis[i]), (3, reps[i + 1]), (4, analysis[i + 1]),
+                                 (5, phis[i + 1]), (6, reps[i]), (7, analysis[i]), (15, fit_buf)], *sizes[i])
 
     # noise bands, their std at full resolution, composition
     bands = [gpu.texture(*sizes[i], 'r32float') for i in range(NOISE_LEVELS)]
@@ -438,7 +445,11 @@ def main(img_path, uniform_level=None, analyse_foveated=False, intensity_fit='we
         gpu.run(P['lap_stats'], [gpu.uniform(i, gx, 0, 0), reps[i], maps, partial], 0, 0, groups=(gx, gy))
         gpu.run(P['lap_finalize'], [gpu.uniform(gx * gy, i, 0, 0), partial, rep_std], 0, 0, groups=(1, 1))
     for i in range(cut):
-        gpu.run(P['band'], [gpu.uniform(h, w, i, randomize, *kp, 0), filt, reps[i], bands[i], rep_std], *sizes[i])
+        # first frame, as main.js: phase tracking reset (state = current orientation), which leaves the phase unchanged
+        bp = gpu.uniform(h, w, i, randomize, *kp, 2)
+        track_prev, track = gpu.texture(*sizes[i], 'r32float'), gpu.texture(*sizes[i], 'r32float')
+        gpu.run(P['track'], [(0, bp), (2, reps[i]), (6, track_prev), (7, track)], *sizes[i])
+        gpu.run(P['band'], [bp, filt, reps[i], bands[i], rep_std, track], *sizes[i])
         std_of(bands[i], 2 ** i, ycc, band_stds, i)
     gpu.run(P['compose'], [pbuf, gpu.uniform(cut, 0, 1, 0), maps, fov, fov_pyr, *bands, band_stds, final, fit_buf], w, h)
 
@@ -562,20 +573,25 @@ def main(img_path, uniform_level=None, analyse_foveated=False, intensity_fit='we
         ok &= report_share(f'displayed contribution L{i} [0..255]', shown_i, np.clip(0.5 + 4 * contrib, 0, 1) * 255, 1.0)
     # phase semantics (semantics.wgsl, "Line / Edge" view): sem_l = angle(c_up^2 / |c_up| * conj(f)), f = level l, c = level l+1
     print('phase semantics (Line / Edge view)')
+    if keep is not None:   # the view shows the repaired statistics before the slider blend (done in noise_band.wgsl)
+        for i, unblended in enumerate(worm.rep_unblended):
+            worm.y[i].update(unblended)
     to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a))[None, None]
     sems = {}
     for variant, flag in [('measured', 1), ('repaired', 0)]:
         key = 'phase' if variant == 'measured' else 'phase_rep'
+        dkey = 'dir' if variant == 'measured' else 'dir_rep'
         for l in range(n_analysis - 1):
             out = gpu.texture(*sizes[l], 'rgba32float')
-            gpu.run(P['sem'], [gpu.uniform(l, flag, 0, 0), analysis[l], reps[l], analysis[l + 1], reps[l + 1], out], *sizes[l])
+            gpu.run(P['sem'], [gpu.uniform(l, flag, int(ALIGN), 0), analysis[l], reps[l], analysis[l + 1], reps[l + 1], out], *sizes[l])
             sems[variant, l] = g = gpu.read(out)
             if l >= len(worm.y) - 1 or key not in worm.y[l + 1]:
                 continue
             # (a) against the package: phu.get_phi_quick on the Worm's phases (only where level l+1 has energy)
             c = torch.polar(worm.y[l + 1]['G-H-complex'].abs(), worm.y[l + 1][key])
             f = torch.polar(torch.ones_like(worm.y[l][key]), worm.y[l][key])
-            ref = phu.get_phi_quick(c, f, upscaling='bicubic')
+            ref = (phu.get_phi_quick_aligned(c, f, worm.y[l + 1][dkey], worm.y[l][dkey]) if ALIGN
+                   else phu.get_phi_quick(c, f, upscaling='bicubic'))
             strong = (ref.abs() > 0.05)[0, 0].numpy()
             ok &= report_share(f'semantics L{l} {variant} [rad]', g[..., 0][strong], ref.angle()[0, 0].numpy()[strong], 1e-2, period=2 * np.pi)
     # (b) where level l is fully extrapolated, its semantics are the repair's phi of level l+1, only upsampled
@@ -584,7 +600,13 @@ def main(img_path, uniform_level=None, analyse_foveated=False, intensity_fit='we
         if l + 2 >= n_analysis:
             continue
         phi_c = gpu.read(phis[l + 1])
-        phi_up = phu.upscale_complex_phase(torch.complex(to_t(phi_c[..., 0]), to_t(phi_c[..., 1])), sizes[l][::-1], mode='bicubic')
+        phi_t = torch.complex(to_t(phi_c[..., 0]), to_t(phi_c[..., 1]))
+        if ALIGN:   # as in phu.extrapolate_phi_aligned: the sign of the angle upsampled in the convention of level l
+            ang_abs_up = isu.upsample(phi_t.angle().abs(), sizes[l][::-1], mode='bicubic')
+            sgn = torch.sign(phu.upsample_aligned(phi_t.angle(), worm.y[l + 1]['dir_rep'], worm.y[l]['dir_rep'], sizes[l][::-1]))
+            phi_up = torch.polar(isu.upsample(phi_t.abs(), sizes[l][::-1], mode='bicubic'), ang_abs_up * sgn)
+        else:
+            phi_up = phu.upscale_complex_phase(phi_t, sizes[l][::-1], mode='bicubic')
         extrap = (worm.a[l]['mask'] == 0)[0, 0].numpy() & (phi_up.abs() > 1e-3)[0, 0].numpy()
         if extrap.any():
             ok &= report_share(f'semantics L{l} = upsampled L{l + 1} ({100 * extrap.mean():.0f}% px)', sems['repaired', l][..., 0][extrap],
@@ -596,9 +618,11 @@ def main(img_path, uniform_level=None, analyse_foveated=False, intensity_fit='we
         return (none + (hue - none) * np.clip(2 * t, 0, 1)[..., None]) * 255
     for mode, variant in [(19, 'measured'), (20, 'repaired')]:
         tex0 = gpu.texture(*sizes[0], 'rgba32float')
-        gpu.run(P['sem'], [gpu.uniform(0, int(variant == 'measured'), 0, 0), analysis[0], reps[0], analysis[1], reps[1], tex0], *sizes[0])
+        gpu.run(P['sem'], [gpu.uniform(0, int(variant == 'measured'), int(ALIGN), 0), analysis[0], reps[0], analysis[1], reps[1], tex0], *sizes[0])
         s0 = sems[variant, 0]
-        ok &= report_share(f'displayed semantics, {variant} [0..255]', render_view(mode, aux=tex0, aux_scale=1.5),
+        tmp, disp = gpu.texture(*sizes[0], 'rgba32float'), gpu.texture(*sizes[0], 'rgba32float')   # display form (sem_smooth.wgsl)
+        gpu.run(P['semH'], [tex0, tmp], *sizes[0]); gpu.run(P['semV'], [tmp, disp], *sizes[0])
+        ok &= report_share(f'displayed semantics, {variant} [0..255]', render_view(mode, aux=disp, aux_scale=1.5),
                            structure_ref(s0[..., 0], 1.5 * s0[..., 1]), 1.0)
 
     if analyse_foveated:   # information only: the same pipeline analysing Python's float32 img.fov

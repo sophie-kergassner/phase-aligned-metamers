@@ -79,6 +79,12 @@
                  background: transparent; color: inherit; cursor: pointer; }
   .pam-plotbtn.on { background: var(--accent-bg); border-color: var(--accent); }
   .seg button.on { background: var(--accent-bg); font-weight: 600; }
+  .pam-align { margin-top: 4px; line-height: 1; }
+  .pam-align button { font: inherit; font-size: 10px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; opacity: 0.7; cursor: pointer; }
+  .pam-align { display: flex; align-items: center; gap: 10px; }
+  .pam-align label { font-size: 10px; display: inline-flex; align-items: center; gap: 3px; opacity: 0.8; cursor: pointer; }
+  .pam-align input { margin: 0; width: 11px; height: 11px; }
+  .pam-align button.on { background: var(--accent-bg); opacity: 1; }
   label { display: flex; align-items: center; gap: 8px; }
   select, input[type=range] { accent-color: var(--accent); }
   select { font: inherit; padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: inherit; }
@@ -147,6 +153,7 @@
     <div id="phaseBox" class="seg pam-overlay pam-phase" hidden>
       <button data-phase="angle" class="on" title="the phase angle (cyclic colour map)">Angle</button>
       <button data-phase="structure" title="which structure the phase describes: line (blue, near 0° / 180°), edge (crimson, near ±90°), no data (white, little energy)">Line / Edge</button>
+      <button data-phase="sure" title="how sure the Line / Edge judgement is: unsure (dark) where it changes from one pixel of the level to the next. There a slightly moved image gives a different judgement, so these are the regions that flicker with Move Image. White: little energy">Sureness</button>
     </div><div id="infoPop" class="pam-popover" role="dialog" hidden><p><span id="status">Starting ...</span> <span id="frame" class="mono"></span></p></div><div class="pam-icons"><select id="image" hidden>
         <option value="../images/classroom.jpg">Classroom</option>
         <option value="../images/drawnhouse.jpg">Drawn House</option>
@@ -155,6 +162,8 @@
         <option value="../images/italianflat.jpg">Italian Flat</option>
         <option value="../images/mossytree.jpg">Mossy Tree</option>
       </select><button type="button" id="infoBtn" class="pam-fs" aria-expanded="false"></button><button type="button" id="sceneBtn" class="pam-fs"></button><button type="button" id="autoGazeBtn" class="pam-fs"></button><button type="button" id="showGazeBtn" class="pam-fs"></button><button type="button" id="fullscreen" class="pam-fs" title="Full screen (Esc to leave); the foveation follows the image's physical size" aria-label="Full screen"></button></div></div>
+  <div class="pam-align"><label title="Translates the input image on a slow circle (48 px radius, 12 s per round, whole pixels) and recomputes everything every frame: shows how stable the noise is over time."><input type="checkbox" id="motion"> Move Image</label><button type="button" id="alignBtn" hidden title="Fix 1 - Phase sign alignment at +-90 deg. The orientation wraps from -90 to +90 deg, and the phase flips its sign there. With the fix, phases are brought to one sign convention before they are interpolated or combined across levels (removes broken structures along horizontal features). Off = as in the paper.">Fix 1 · Phase Sign Alignment: On</button><button type="button" id="orientBtn" hidden title="Fix 2 - Orientation smoothing. The orientation is computed from C2, C3 averaged over a 7x7 Gaussian window (sigma 2 px) instead of the 5x5 box, and the repair weights upsampled orientations by their confidence. Steadier orientation and phase. Off = as in the paper.">Fix 2 · Orientation Smoothing: On</button><button type="button" id="trackBtn" hidden title="Fix 3 - Random phase tracking (only with the Phase slider below 1 and a moving image). Each pixel follows its orientation over the full circle from frame to frame and inverts its random phase where the orientation wrapped at +-90 deg, so the noise does not jump there. Off = the random phase jumps at the wrap.">Fix 3 · Random Phase Tracking: On</button><button type="button" id="denseBtn" hidden title="Fix 4 - Dense coarse evaluation. The repair (and the Line / Edge view) combine each level with the next coarser one, whose response was interpolated from its fewer pixels. That interpolation depends on where the image sits relative to the coarse pixels, so a moving image changed the extrapolated phases (and the Line / Edge judgement) of whole regions. Now, where the coarser level is measured, its filters (same size) are evaluated at every pixel of the finer level; where it is itself extrapolated, it stays interpolated. The pyramid is unchanged. Off = interpolated, as in the paper.">Fix 4 · Dense Coarse Evaluation: On</button>
+      <button type="button" id="temporalBtn" hidden title="Fix 5 - Temporal phase smoothing. In regions where line vs. edge is not clear, the phase of the statistics jumps from frame to frame when the image moves, and the noise built from it flickers. Now the phase of every level is averaged over the last frames (as a complex number, weighted by the intensity), right after the level is computed, so the finer levels are extrapolated from the smoothed phase. Intensity and orientation are not smoothed. How many frames depends on the level, so that every level lags by the same amount in its own pixels: 3 at L3 (?smooth=N for N), 2 at L2, 1.5 at L1, hardly any at L0 (there the image moves a whole pixel per frame, and averaging would mix different image positions, e.g. across a line / edge boundary); 5 at L4, 9 at L5. A still image is unchanged. Off = per frame, as in the paper.">Fix 5</button></div>
   <p id="viewNote" class="note" hidden></p>
   <div id="flow" class="flow"></div>
 
