@@ -112,7 +112,7 @@ TITLE_CSS = 'font-weight:600; min-width:0; overflow:hidden; text-overflow:ellips
 
 
 def _figure_html(rgb, info, title, colorbar=True, max_px=1200):
-    """HTML <figure>: the image (scaled to the available width) and a text caption below it."""
+    """HTML block (plain divs; GitHub strips <figure>/<figcaption>): the image (scaled to the available width) and a text caption below it."""
     import html
     src, rendering = _encode_image(rgb, max_px)
 
@@ -132,10 +132,10 @@ def _figure_html(rgb, info, title, colorbar=True, max_px=1200):
                   f'<span style="{mono}">{fmt(info["vmax"])}</span>{data_note}</div>')
     else:  # RGB: no colormap, so only the value range
         legend = f'<div style="margin-top:2px"><span style="{mono}">range [{fmt(info["min"])}, {fmt(info["max"])}]</span></div>'
-    return (f'<figure style="margin:0; min-width:0">'
+    return (f'<div style="margin:0; min-width:0">'
             f'<img src="{src}" style="width:100%; height:auto; display:block; border-radius:2px; image-rendering:{rendering}">'
-            f'<figcaption style="font-family:sans-serif; font-size:13px; line-height:1.35; margin-top:5px">'
-            f'{head}{legend}</figcaption></figure>')
+            f'<div style="font-family:sans-serif; font-size:13px; line-height:1.35; margin-top:5px">'
+            f'{head}{legend}</div></div>')
 
 
 def _wrap(html_str, suptitle=''):
@@ -169,13 +169,13 @@ def show_figure(fig, title='', note='', max_width=None):
     svg = svg.replace(THEME_COLOR, 'currentColor')
     svg = re.sub(r'<svg([^>]*?) width="[^"]*" height="[^"]*"', r'<svg\1 width="100%" height="auto"', svg, count=1)
     mono = "font-family:ui-monospace,Consolas,monospace; font-size:11px; opacity:0.65; white-space:nowrap"
-    out = (f'<figure style="margin:0; max-width:{int(max_width)}px">'
+    out = (f'<div style="margin:0; max-width:{int(max_width)}px">'
            f'<div style="line-height:0">{svg}</div>'
-           f'<figcaption style="font-family:sans-serif; font-size:13px; line-height:1.35; margin-top:5px; '
+           f'<div style="font-family:sans-serif; font-size:13px; line-height:1.35; margin-top:5px; '
            f'display:flex; justify-content:space-between; align-items:baseline; gap:8px">'
            f'<span title="{html.escape(title)}" style="{TITLE_CSS}">{html.escape(title)}</span>'
            f'<span style="{mono}; flex-shrink:0">{html.escape(note)}</span>'
-           f'</figcaption></figure>')
+           f'</div></div>')
     if _display_html(out):
         plt.close(fig)
     else:

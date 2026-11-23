@@ -8,13 +8,19 @@ import phase_aligned_metamers.phase_analysis_utils as phu
 class Worm:
     MIN_LEVEL_SIZE = 8  # smallest allowed image side [px] of a pyramid level (9x9 steerable filters, reflect padding)
 
-    def __init__(self, device, img, pyr_level_map, MAX_DEPTH, fit_levels=None, _debug=False):
+    def __init__(self, device, img, pyr_level_map, MAX_DEPTH, fit_levels=None, align_phase_convention=True, _debug=False):
         """
         fit_levels:    number of pyramid levels above the cutoff level that are built for the intensity fit. None (default):
                        as many as possible, i.e. down to the smallest level with at least MIN_LEVEL_SIZE px per side
                        (as in the paper's code, where the pyramid was 9 levels deep).
+        align_phase_convention: (dir, phase) and (dir + pi, -phase) describe the same signal (H is odd), so the phase
+                       is conjugated where the orientation wraps at +-90 deg. True (default): repair_orientation /
+                       repair_phase bring every phase into a common orientation convention before interpolating or
+                       combining it, which removes broken structures along horizontal features. False: as in the
+                       paper. Found after the project was finished; see fixes/1_phase_sign_alignment.md.
         """
         self.DEVICE = device
+        self.align_phase_convention = align_phase_convention
 
         self.img = img.clone()
 
@@ -288,12 +294,19 @@ class Worm:
 
             # upscale coarse_dir in [-pi, pi] and transform back to [-pi/2, pi/2]
             coarse_dir = torch.polar(torch.ones_like(coarse_dir), 2  *coarse_dir)  # displaying .angle() shows that it goes from -pi to pi
-            coarse_dir_up = phu.upscale_complex_img(coarse_dir, size_up=size_fine, mode='bicubic')
-            coarse_dir_up = torch.polar(coarse_dir_up.abs(), 0.5 * coarse_dir_up.angle())  # remap to -pi/2, pi/2
+            coarse_dir2_up = phu.upscale_complex_img(coarse_dir, size_up=size_fine, mode='bicubic')   # doubled angle
+            coarse_dir_up = torch.polar(coarse_dir2_up.abs(), 0.5 * coarse_dir2_up.angle())  # remap to -pi/2, pi/2
 
             fine_dir = pyr[scale]['dir']
-            fine_dir = torch.polar(torch.ones_like(fine_dir), fine_dir)
 
+            if self.align_phase_convention:
+                # blended in the doubled-angle domain: +89 deg and -89 deg are nearly the same orientation and must
+                # not cancel, as they do when blended as single angles below
+                dir2 = torch.polar(torch.ones_like(fine_dir), 2 * fine_dir) * mask_fine                        + coarse_dir2_up / (coarse_dir2_up.abs() + 1e-12) * (1 - mask_fine)
+                pyr[scale]['dir_rep'] = 0.5 * dir2.angle()
+                continue
+
+            fine_dir = torch.polar(torch.ones_like(fine_dir), fine_dir)
             dir_repaired = fine_dir / fine_dir.abs() * mask_fine + coarse_dir_up / (coarse_dir_up.abs() + 1e-12) * (1 - mask_fine)
             pyr[scale]['dir_rep'] = dir_repaired.angle()
         return pyr
@@ -301,6 +314,19 @@ class Worm:
         for scale in range(self.cutoff - 1, -1, -1):
             mask_fine   = self.a[scale]['mask']
             size_fine   = self.meta[scale]['size']
+
+            if self.align_phase_convention:
+                # every phase in the convention of the orientation it is combined with (phu.align_sign): c in that of
+                # f (level s+1), the extrapolated and the measured phase in that of the repaired orientation of level s
+                dir_out = pyr[scale]['dir_rep']
+                f = torch.polar(pyr[scale+1]['G-H-complex'].abs(), pyr[scale+1]['phase_rep'])
+                c = torch.polar(pyr[scale+2]['G-H-complex'].abs(), pyr[scale+2]['phase_rep'])
+                phi = phu.get_phi_quick_aligned(c, f, pyr[scale+2]['dir_rep'], pyr[scale+1]['dir_rep'])
+                phase_up = phu.extrapolate_phi_aligned(phi, f, pyr[scale+1]['dir_rep'], dir_out)
+                phase_fine = torch.polar(torch.ones_like(dir_out), phu.align_sign(pyr[scale]['dir'], dir_out) * pyr[scale]['phase'])
+                phase_repaired = phase_fine * mask_fine + phase_up / (phase_up.abs() + 1e-12) * (1 - mask_fine)
+                pyr[scale]['phase_rep'] = phase_repaired.angle()
+                continue
 
             phase_fine = torch.polar(torch.ones_like(pyr[scale]['phase']), pyr[scale]['phase'])
 

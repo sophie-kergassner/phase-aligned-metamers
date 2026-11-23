@@ -149,3 +149,85 @@ def extrapolate_phi(phi, c, steps_up:int, upscaling_mode='bicubic'):
     f_recon = torch.polar(c_up.abs(), f_phase)
 
     return f_recon
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase convention alignment (Worm(align_phase_convention=True); see fixes/1_phase_sign_alignment.md)
+#
+# The orientation is only defined modulo pi, but the steered H filter is odd: H(theta + pi) = -H(theta). So
+# (dir, phase) and (dir + pi, -phase) describe the same local signal, and where dir wraps from -pi/2 to +pi/2 the
+# phase is conjugated. Before complex responses of different pixels / levels are interpolated or combined, each is
+# brought into the convention of a reference orientation: conjugated where its own orientation points the other way.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def align_sign(theta, theta_ref):
+    """-1 where orientation theta points away from theta_ref (cos(theta - theta_ref) < 0), else +1."""
+    return torch.where(torch.cos(theta - theta_ref) < 0, -1.0, 1.0).to(theta.dtype)
+
+
+def _cubic_weights(t, A=-0.75):
+    """Cubic convolution weights of the 4 taps (base - 1 .. base + 2) for fractional position t, as grid_sample."""
+    def k1(x): return ((A + 2) * x - (A + 3)) * x * x + 1
+    def k2(x): return ((A * x - 5 * A) * x + 8 * A) * x - 4 * A
+    return [k2(t + 1), k1(t), k1(1 - t), k2(2 - t)]
+
+
+def upsample_aligned(x, theta, theta_ref, size):
+    """
+    isu.upsample(x, size, 'bicubic') with every one of the 16 taps aligned to the orientation of the target pixel:
+    a tap at source pixel q is taken as-is where cos(theta[q] - theta_ref[p]) >= 0, otherwise conjugated (complex x)
+    or negated (real x, an odd quantity such as a phase angle).
+
+    x:         [N, 1, h, w] complex or real field in the convention of theta
+    theta:     [N, 1, h, w] orientation of each source pixel
+    theta_ref: [N, 1, H, W] reference orientation of each target pixel
+    size:      target (H, W)
+    Same sample positions and border handling as isu.upsample (grid_sample bicubic, align_corners=True, border).
+    """
+    h, w = x.shape[-2:]
+    H, W = int(size[0]), int(size[1])
+    real_dtype = theta.dtype
+    fy = 2.0 ** round(torch.log2(torch.tensor(H / h)).item())
+    fx = 2.0 ** round(torch.log2(torch.tensor(W / w)).item())
+    py = torch.arange(H, device=x.device, dtype=real_dtype) / fy
+    px = torch.arange(W, device=x.device, dtype=real_dtype) / fx
+    by, bx = torch.floor(py), torch.floor(px)
+    wy, wx = _cubic_weights(py - by), _cubic_weights(px - bx)
+    by, bx = by.long(), bx.long()
+
+    out = torch.zeros(x.shape[:2] + (H, W), dtype=x.dtype, device=x.device)
+    for j in range(4):
+        iy = (by - 1 + j).clamp(0, h - 1)
+        for i in range(4):
+            ix = (bx - 1 + i).clamp(0, w - 1)
+            tap = x[..., iy[:, None], ix[None, :]]
+            sg = align_sign(theta[..., iy[:, None], ix[None, :]], theta_ref)
+            tap = torch.complex(tap.real, sg * tap.imag) if torch.is_complex(tap) else sg * tap
+            out = out + (wy[j][:, None] * wx[i][None, :]) * tap
+    return out
+
+
+def get_phi_quick_aligned(c, f, dir_c, dir_f):
+    """get_phi_quick with c upsampled in the orientation convention of f (dir_f); phi is in that convention too."""
+    c_up = upsample_aligned(c, dir_c, dir_f, f.shape[2:])
+    c_hat = c_up**2 / (c_up.abs() + 1e-6)
+    return c_hat * torch.conj(f)
+
+
+def extrapolate_phi_aligned(phi, f, dir_f, dir_out):
+    """
+    extrapolate_phi(phi, f, steps_up=1) followed by the upsampling to the size of dir_out (Worm.repair_phase), with
+    phi and f upsampled in the orientation convention of dir_out (both are in the convention of dir_f).
+    The result is at the size of dir_out and in its convention.
+    """
+    size_up = dir_out.shape[2:]
+    # upscale_complex_phase: |angle| and magnitude do not depend on the convention, only the sign of the angle does
+    phi_angle = phi.angle()
+    phi_angle_abs_up = isu.upsample(phi_angle.abs(), size_up, mode='bicubic')
+    phi_angle_up = phi_angle_abs_up * torch.sign(upsample_aligned(phi_angle, dir_f, dir_out, size_up))
+    phi_up = torch.polar(isu.upsample(phi.abs(), size_up, mode='bicubic'), phi_angle_up)
+
+    f_up = upsample_aligned(f, dir_f, dir_out, size_up)
+    f_phase = 2 * f_up.angle() - phi_up.angle()
+    f_phase = (f_phase + torch.pi) % (2 * torch.pi) - torch.pi
+    return torch.polar(f_up.abs(), f_phase)
