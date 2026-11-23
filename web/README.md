@@ -33,6 +33,8 @@ It copies `main.js`, `constants.json`, `shaders/` and the six study scenes (`ima
 
 ## Testing against the Python package
 
+Needs the requirements of the [Python package](../python/README.md#requirements) plus `wgpu`:
+
 ```
 pip install wgpu
 python web/test_webgpu.py [path/to/image] [--uniform=LEVEL] [--analyse-foveated]
